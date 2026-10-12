@@ -1,0 +1,541 @@
+# ESPHome firmware: LilyGo T5 V2.4.1 with the 7.5" black/white e-paper (DKE DEPG0750BN, 800x480).
+#
+# The board shows what the Home Assistant package homeassistant/mealie_epaper.yaml holds in
+# sensor.epaper_recipe_screen: the ingredients on the left, the current step on the right.
+# The three buttons on the board do previous, next and clear.
+#
+# Setup
+#   1. Put these three lines into secrets.yaml next to this file:
+#        wifi_ssid: "..."
+#        wifi_password: "..."
+#        api_encryption_key: "..."   # make one with: openssl rand -base64 32
+#   2. Connect the board with USB and flash it:
+#        esphome run mealie-epaper.yaml
+#   3. Add the board to Home Assistant, or the display stays empty: under Settings > Devices & services it shows
+#      up as discovered. If it does not, add the ESPHome integration there with the IP address of the board.
+#      Enter the API key from secrets.yaml when Home Assistant asks for it.
+#
+# This needs ESPHome 2026.9 or newer.
+#
+# German labels, another name or other pins: leave this file as it is. Copy local.example.yaml to local.yaml,
+# set your values there and flash local.yaml. Git ignores local.yaml.
+
+substitutions:
+  name: mealie-epaper
+  friendly_name: Recipe display
+  # The language of the words on the display: en or de.
+  language: en
+  # The Home Assistant sensor with the screen. Only change it if you renamed the sensor in the package.
+  screen_entity: sensor.epaper_recipe_screen
+  # 0 or 180, depending on which way up the display stands.
+  rotation: "0"
+  # Page turns are quick partial refreshes that only move the pixels that change. Every so many refreshes all pixels
+  # are moved to remove shadows.
+  full_update_every: "8"
+  # The fonts, by their names on fonts.google.com. The title font is for the black bar at the top.
+  font_text: Nunito
+  font_text_weight: "600"
+  font_title: Courgette
+  font_title_weight: "400"
+  # How far the lines of text are apart, in percent of what the text font asks for. Nunito asks for a lot.
+  line_spacing: "86"
+  # The pins of the T5 V2.4.1.
+  pin_clk: GPIO18
+  pin_mosi: GPIO23
+  pin_cs: GPIO5
+  pin_dc: GPIO17
+  pin_reset: GPIO16
+  pin_busy: GPIO4
+  pin_button_previous: GPIO37
+  pin_button_next: GPIO38
+  pin_button_clear: GPIO39
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+logger:
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+spi:
+  clk_pin: ${pin_clk}
+  mosi_pin: ${pin_mosi}
+
+# GF_Latin_Core has most letters of the European languages that use the Latin alphabet, among them the German
+# umlauts. The glyphs line adds the rest of them and the fractions. The Home Assistant package replaces every
+# character that is not in here, so change both together.
+font:
+  - file: "gfonts://${font_title}@${font_title_weight}"
+    id: font_header
+    size: 28
+    glyphsets: &glyphsets
+      - GF_Latin_Core
+    glyphs: &glyphs
+      - "¤¦¬±µ¼½¾ĈĉĔĕĜĝĤĥĨĩĬĭĴĵĸĿŀŊŋŌōŎŏŖŗŜŝŢţŦŧŨũŬŭ"
+    # The fonts have no separate accents to combine with letters. They are not needed.
+    ignore_missing_glyphs: true
+  # The step and the ingredients each take the largest of their three sizes that fits.
+  - file: "gfonts://${font_text}@${font_text_weight}"
+    id: font_step_large
+    size: 32
+    glyphsets: *glyphsets
+    glyphs: *glyphs
+    ignore_missing_glyphs: true
+  - file: "gfonts://${font_text}@${font_text_weight}"
+    id: font_step_medium
+    size: 26
+    glyphsets: *glyphsets
+    glyphs: *glyphs
+    ignore_missing_glyphs: true
+  - file: "gfonts://${font_text}@${font_text_weight}"
+    id: font_step_small
+    size: 21
+    glyphsets: *glyphsets
+    glyphs: *glyphs
+    ignore_missing_glyphs: true
+  - file: "gfonts://${font_text}@${font_text_weight}"
+    id: font_ingredients_large
+    size: 24
+    glyphsets: *glyphsets
+    glyphs: *glyphs
+    ignore_missing_glyphs: true
+  - file: "gfonts://${font_text}@${font_text_weight}"
+    id: font_ingredients_medium
+    size: 20
+    glyphsets: *glyphsets
+    glyphs: *glyphs
+    ignore_missing_glyphs: true
+  - file: "gfonts://${font_text}@${font_text_weight}"
+    id: font_ingredients_small
+    size: 17
+    glyphsets: *glyphsets
+    glyphs: *glyphs
+    ignore_missing_glyphs: true
+
+globals:
+  # What the display shows: title, page, step, ingredients and scale. The display draws from this copy and not from
+  # the sensors, so that it can draw the same picture a second time.
+  - id: shown
+    type: std::vector<std::string>
+    restore_value: false
+    initial_value: "std::vector<std::string>(5)"
+  - id: drawn_once
+    type: bool
+    restore_value: false
+    initial_value: "false"
+  # The slow refresh has drawn a picture that the fast refresh does not know yet.
+  - id: need_sync
+    type: bool
+    restore_value: false
+    initial_value: "false"
+
+# Home Assistant sends an attribute when it changes, and all of them again when the board connects.
+text_sensor:
+  - id: ha_title
+    attribute: title
+    <<: &screen_attribute
+      platform: homeassistant
+      entity_id: ${screen_entity}
+      internal: true
+      on_value:
+        - script.execute: redraw
+  - id: ha_page
+    attribute: page
+    <<: *screen_attribute
+  - id: ha_step
+    attribute: step
+    <<: *screen_attribute
+  - id: ha_ingredients
+    attribute: ingredients
+    <<: *screen_attribute
+  - id: ha_scale
+    attribute: scale
+    <<: *screen_attribute
+
+script:
+  # One change in Home Assistant arrives as several attributes. The short wait makes one refresh out of them.
+  # A page turn is a fast refresh. A new recipe, an empty display and the first picture after a start are a slow
+  # refresh: it flashes and takes about four seconds, and it removes the shadows that fast refreshes leave behind.
+  - id: redraw
+    mode: restart
+    then:
+      - delay: 200ms
+      - while:
+          condition:
+            lambda: |-
+              return id(need_sync) || !id(drawn_once) ||
+                     id(shown) != std::vector<std::string>{id(ha_title).state, id(ha_page).state, id(ha_step).state,
+                                                           id(ha_ingredients).state, id(ha_scale).state};
+          then:
+            # The panel does not take a new picture while it is still refreshing.
+            - wait_until:
+                condition:
+                  lambda: return !id(epaper).is_in_loop_state() && !id(epaper_clean).is_in_loop_state();
+            - lambda: |-
+                if (id(need_sync)) {
+                  // The fast refresh only moves the pixels that differ from the picture the panel remembers, and the
+                  // slow refresh does not write that memory. Drawing the same picture again with the fast one does.
+                  id(need_sync) = false;
+                  id(epaper).update();
+                  return;
+                }
+                const std::vector<std::string> wanted = {id(ha_title).state, id(ha_page).state, id(ha_step).state,
+                                                         id(ha_ingredients).state, id(ha_scale).state};
+                const bool blank = wanted[0].empty() && wanted[1].empty() && wanted[2].empty() && wanted[3].empty();
+                const bool new_recipe = !id(shown)[0].empty() && wanted[0] != id(shown)[0];
+                const bool clean = !id(drawn_once) || blank || new_recipe;
+                id(shown) = wanted;
+                id(drawn_once) = true;
+                if (clean) {
+                  id(need_sync) = true;
+                  id(epaper_clean).update();
+                } else {
+                  id(epaper).update();
+                }
+
+# The buttons pull their pin to ground. The board has the pull-up resistors.
+binary_sensor:
+  - platform: gpio
+    id: button_previous
+    pin:
+      number: ${pin_button_previous}
+      inverted: true
+    filters:
+      - delayed_on: 20ms
+    on_press:
+      - homeassistant.event:
+          event: esphome.epaper_recipe_button
+          data:
+            button: previous
+  - platform: gpio
+    id: button_next
+    pin:
+      number: ${pin_button_next}
+      inverted: true
+    filters:
+      - delayed_on: 20ms
+    on_press:
+      - homeassistant.event:
+          event: esphome.epaper_recipe_button
+          data:
+            button: next
+  - platform: gpio
+    id: button_clear
+    pin:
+      number: ${pin_button_clear}
+      inverted: true
+    filters:
+      - delayed_on: 20ms
+    on_press:
+      - homeassistant.event:
+          event: esphome.epaper_recipe_button
+          data:
+            button: clear
+
+# The panel has a UC8179 controller, like the Waveshare 7.5" V2. This driver needs ESPHome 2026.9 or newer.
+# The panel is here twice, because the driver can not change the waveform while it runs: "epaper" refreshes fast,
+# "epaper_clean" at the end of this file refreshes slowly and cleanly. Both draw the same picture on the same pins.
+display:
+  - platform: epaper_spi
+    id: epaper
+    model: Waveshare-7.5in-V2
+    full_update_every: ${full_update_every}
+    # The speed LilyGo uses for this panel.
+    data_rate: 4MHz
+    # The fast waveform that Waveshare panels have built in is not in this panel: with it a refresh takes four
+    # seconds. So the panel gets the short waveform from LilyGo's own driver (GxDEPG0750BN.cpp) before every
+    # refresh. It moves only the pixels that change, for 20 frames, which is less than half a second.
+    init_sequence:
+      - [0x01, 0x07, 0x07, 0x3F, 0x3F]  # voltages
+      - [0x04]  # power on, the tables below need it
+      - delay 200ms
+      - [0x00, 0x3F]  # black and white, waveform from the tables below
+      - [0x61, 0x03, 0x20, 0x01, 0xE0]  # 800 x 480
+      - [0x15, 0x00]
+      - [0x82, 0x26]  # VCOM -2.0 V
+      - [0x60, 0x22]
+      # Waveform tables, 42 bytes each: VCOM, white stays white, black to white, white to black, black stays black.
+      - [0x20, 0x00, 0x00, 0x14, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+      - [0x21, 0x00, 0x00, 0x14, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+      - [0x22, 0x20, 0x00, 0x14, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+      - [0x23, 0x10, 0x00, 0x14, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+      - [0x24, 0x00, 0x00, 0x14, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    # The board has the display on this pin, which the chip also reads when it starts. That is fine here.
+    cs_pin: &shared_cs
+      number: ${pin_cs}
+      ignore_strapping_warning: true
+      allow_other_uses: true
+    dc_pin: &shared_dc
+      number: ${pin_dc}
+      allow_other_uses: true
+    reset_pin: &shared_reset
+      number: ${pin_reset}
+      allow_other_uses: true
+    # The panel holds this pin low while it is busy. Without "inverted" the driver would not wait for it.
+    busy_pin: &shared_busy
+      number: ${pin_busy}
+      inverted: true
+      allow_other_uses: true
+    rotation: ${rotation}
+    # The display is only refreshed when the content changes, see the script above.
+    update_interval: never
+    lambda: &draw |-
+      const Color ink = Color::BLACK;
+      const Color paper = Color::WHITE;
+      const bool german = std::string("${language}") == "de";
+
+      const std::string &title = id(shown)[0];
+      const std::string &page = id(shown)[1];
+      std::string step = id(shown)[2];
+      const std::string &ingredients = id(shown)[3];
+      std::string scale = id(shown)[4];
+
+      // Nothing to show: the display stays white.
+      if (title.empty() && page.empty() && step.empty() && ingredients.empty())
+        return;
+      if (step.empty() && page.empty())
+        step = german ? "Dieses Rezept hat keine Schritte." : "This recipe has no steps.";
+
+      const int width = it.get_width();
+      const int height = it.get_height();
+      const int margin = 14;
+      const int header_height = 46;
+      const int top = header_height + 12;
+      const int bottom = height - 8;
+      const int ingredients_width = 276;
+      const int divider_x = margin + ingredients_width + 12;
+      const int step_x = divider_x + 16;
+      const int step_width = width - margin - step_x;
+
+      auto text_width = [&](display::BaseFont *font, const std::string &text) -> int {
+        int x, y, w, h;
+        it.get_text_bounds(0, 0, text.c_str(), font, TextAlign::TOP_LEFT, &x, &y, &w, &h);
+        return w;
+      };
+      // A font asks for more room between lines than this display can spare. "line" is how far the lines are apart,
+      // "shift" is how far the text moves up to sit in the middle of its line, "base" is where the letters stand.
+      struct Metrics {
+        int line;
+        int shift;
+        int base;
+      };
+      auto metrics = [&](display::BaseFont *font) -> Metrics {
+        int w, x, baseline, h;
+        font->measure("Ag", &w, &x, &baseline, &h);
+        const int line = h * ${line_spacing} / 100;
+        return {line, (h - line) / 2, baseline - (h - line) / 2};
+      };
+      // Removes the last character, which can be several bytes long in UTF-8.
+      auto drop_last = [](std::string &text) {
+        while (!text.empty() && (text.back() & 0xC0) == 0x80)
+          text.pop_back();
+        if (!text.empty())
+          text.pop_back();
+      };
+      // Cuts the text until it fits together with "…".
+      auto shorten = [&](display::BaseFont *font, std::string text, int max_width) -> std::string {
+        while (!text.empty() && text_width(font, text + "…") > max_width) {
+          drop_last(text);
+          while (!text.empty() && text.back() == ' ')
+            text.pop_back();
+        }
+        return text + "…";
+      };
+      // Breaks the text into lines that fit. Line breaks in the text stay, an empty line stays an empty line.
+      auto wrap = [&](display::BaseFont *font, const std::string &text, int max_width) -> std::vector<std::string> {
+        std::vector<std::string> lines;
+        size_t start = 0;
+        while (start <= text.size()) {
+          size_t end = text.find('\n', start);
+          if (end == std::string::npos)
+            end = text.size();
+          std::string line;
+          size_t at = start;
+          while (at < end) {
+            size_t space = text.find(' ', at);
+            if (space == std::string::npos || space > end)
+              space = end;
+            std::string word = text.substr(at, space - at);
+            at = space + 1;
+            if (word.empty())
+              continue;
+            if (text_width(font, line.empty() ? word : line + " " + word) <= max_width) {
+              line += line.empty() ? word : " " + word;
+              continue;
+            }
+            if (!line.empty())
+              lines.push_back(line);
+            // A word that is wider than the column is broken between two characters.
+            while (text_width(font, word) > max_width) {
+              std::string head = word;
+              while (!head.empty() && text_width(font, head) > max_width)
+                drop_last(head);
+              if (head.empty())
+                break;
+              lines.push_back(head);
+              word = word.substr(head.size());
+            }
+            line = word;
+          }
+          lines.push_back(line);
+          start = end + 1;
+        }
+        return lines;
+      };
+
+      // Header: the name of the recipe on the left, the number of the step on the right.
+      it.filled_rectangle(0, 0, width, header_height, ink);
+      int title_width = width - 2 * margin;
+      if (!page.empty()) {
+        std::string label = (german ? "Schritt " : "Step ") + page;
+        it.print(width - margin, header_height / 2, id(font_header), paper, TextAlign::CENTER_RIGHT, label.c_str());
+        title_width -= text_width(id(font_header), label) + 24;
+      }
+      std::string shown_title = text_width(id(font_header), title) <= title_width
+                                    ? title
+                                    : shorten(id(font_header), title, title_width);
+      it.print(margin, header_height / 2, id(font_header), paper, TextAlign::CENTER_LEFT, shown_title.c_str());
+      it.filled_rectangle(divider_x, top, 2, bottom - top, ink);
+
+      // Ingredients. A row is one line on the display.
+      struct Row {
+        std::string text;
+        int gap;        // space above the row
+        bool bullet;    // first line of an ingredient
+        bool indented;  // line of an ingredient
+        bool heading;   // title of a section, underlined
+        int items;      // how many ingredients are complete after this row
+      };
+      if (!scale.empty()) {
+        if (german)
+          std::replace(scale.begin(), scale.end(), '.', ',');
+        scale = (german ? "Mengen wie im Rezept, nicht ×" : "Amounts as written, not ×") + scale;
+      }
+      display::BaseFont *ingredient_fonts[] = {id(font_ingredients_large), id(font_ingredients_medium),
+                                               id(font_ingredients_small)};
+      for (int size = 0; size < 3; size++) {
+        display::BaseFont *font = ingredient_fonts[size];
+        const Metrics m = metrics(font);
+        const int line = m.line;
+        const int indent = line * 2 / 3;
+        std::vector<Row> rows;
+        int items = 0;
+        // The note about a scaled recipe comes first.
+        if (!scale.empty()) {
+          for (const std::string &text : wrap(font, scale, ingredients_width))
+            rows.push_back({text, 0, false, false, false, 0});
+        }
+        size_t start = 0;
+        while (start < ingredients.size()) {
+          size_t end = ingredients.find('\n', start);
+          if (end == std::string::npos)
+            end = ingredients.size();
+          std::string entry = ingredients.substr(start, end - start);
+          start = end + 1;
+          if (entry.empty())
+            continue;
+          const bool heading = entry.rfind("# ", 0) == 0;
+          std::vector<std::string> lines = heading ? wrap(font, entry.substr(2), ingredients_width)
+                                                   : wrap(font, entry, ingredients_width - indent);
+          if (!heading)
+            items++;
+          for (size_t i = 0; i < lines.size(); i++) {
+            const bool last = i + 1 == lines.size();
+            // Some space above the title of a section and below the note about a scaled recipe.
+            const bool after_note = !rows.empty() && !rows.back().indented && !rows.back().heading;
+            const int gap = i == 0 && !rows.empty() && (heading || after_note) ? line / 2 : 0;
+            rows.push_back({lines[i], gap, !heading && i == 0, !heading, heading, last ? items : items - (heading ? 0 : 1)});
+          }
+        }
+        int needed = 0;
+        for (const Row &row : rows)
+          needed += row.gap + line;
+        if (needed > bottom - top && size < 2)
+          continue;  // try the next smaller font
+
+        // If even the smallest font does not fit, the list ends with how many ingredients are missing.
+        size_t count = rows.size();
+        if (needed > bottom - top) {
+          int used = line;  // the line for "+N more"
+          count = 0;
+          while (count < rows.size() && used + rows[count].gap + line <= bottom - top) {
+            used += rows[count].gap + line;
+            count++;
+          }
+          // Do not end in the middle of an ingredient or with the title of a section.
+          while (count > 0 && (rows[count - 1].heading || (count < rows.size() && rows[count].indented && !rows[count].bullet)))
+            count--;
+        }
+        int y = top;
+        for (size_t i = 0; i < count; i++) {
+          const Row &row = rows[i];
+          y += row.gap;
+          if (row.bullet)
+            it.filled_circle(margin + line / 6, y + m.base - line * 3 / 10, std::max(3, line / 7), ink);
+          it.print(margin + (row.indented ? indent : 0), y - m.shift, font, ink, TextAlign::TOP_LEFT, row.text.c_str());
+          if (row.heading)
+            it.horizontal_line(margin, y + m.base + 3, text_width(font, row.text), ink);
+          y += line;
+        }
+        if (count < rows.size()) {
+          const int missing = items - (count > 0 ? rows[count - 1].items : 0);
+          it.printf(margin, y - m.shift, font, ink, TextAlign::TOP_LEFT, german ? "+%d weitere" : "+%d more", missing);
+        }
+        break;
+      }
+
+      // The step.
+      display::BaseFont *step_fonts[] = {id(font_step_large), id(font_step_medium), id(font_step_small)};
+      for (int size = 0; size < 3; size++) {
+        display::BaseFont *font = step_fonts[size];
+        const Metrics m = metrics(font);
+        const int line = m.line;
+        std::vector<std::string> lines = wrap(font, step, step_width);
+        // An empty line between two paragraphs takes half the height.
+        int needed = 0;
+        for (const std::string &text : lines)
+          needed += text.empty() ? line / 2 : line;
+        if (needed > bottom - top && size < 2)
+          continue;  // try the next smaller font
+        int y = top;
+        for (size_t i = 0; i < lines.size(); i++) {
+          const int this_height = lines[i].empty() ? line / 2 : line;
+          // The package splits long steps, so this is only for the rare step that still does not fit.
+          bool is_last = i + 1 == lines.size();
+          if (!is_last && y + this_height + line > bottom) {
+            it.print(step_x, y - m.shift, font, ink, TextAlign::TOP_LEFT, shorten(font, lines[i], step_width).c_str());
+            break;
+          }
+          it.print(step_x, y - m.shift, font, ink, TextAlign::TOP_LEFT, lines[i].c_str());
+          y += this_height;
+        }
+        break;
+      }
+
+  # The same panel with its own built-in waveform. It is slow, flashes, and leaves a clean picture.
+  - platform: epaper_spi
+    id: epaper_clean
+    model: Waveshare-7.5in-V2
+    data_rate: 4MHz
+    cs_pin: *shared_cs
+    dc_pin: *shared_dc
+    reset_pin: *shared_reset
+    busy_pin: *shared_busy
+    rotation: ${rotation}
+    update_interval: never
+    lambda: *draw

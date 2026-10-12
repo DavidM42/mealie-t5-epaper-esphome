@@ -1,0 +1,266 @@
+# Home Assistant package: show a Mealie recipe on a LilyGo T5 7.5" e-paper display.
+#
+# The display runs the ESPHome firmware from esphome/mealie-epaper.yaml. It reads sensor.epaper_recipe_screen
+# from Home Assistant and draws it, so this package never talks to the board itself.
+#
+# Setup
+#   1. Copy this file to <config>/packages/mealie_epaper.yaml and make sure configuration.yaml has
+#        homeassistant:
+#          packages: !include_dir_named packages
+#   2. Restart Home Assistant.
+#   3. Flash the display and add it to Home Assistant with the ESPHome integration.
+#   4. Start Mealie with HTTP_ALLOW_LIST set to the address of Home Assistant. Without it Mealie does not
+#      send anything to addresses in your home network.
+#   5. In Mealie, open Data Management, go to Recipe Actions and add an action of the type POST with this address:
+#        http://<home assistant>:8123/api/webhook/epaper_recipe
+#   6. Open a recipe in Mealie and run the action. The display shows the first step and the ingredients.
+#
+# If Mealie is not in the same network as Home Assistant, see the note at local_only below.
+#
+# What you get
+#   script.epaper_recipe_next      Go to the next step.
+#   script.epaper_recipe_previous  Go to the previous step.
+#   script.epaper_recipe_show      Show the current step again, or jump to another one.
+#   script.epaper_recipe_clear     Empty the display.
+#   sensor.epaper_recipe           The name of the recipe. Its steps are in the attribute "pages".
+#   sensor.epaper_recipe_screen    What the display shows right now. The board reads this.
+#   counter.epaper_recipe_page     The number of the page that is showing, starting at 1.
+#   timer.epaper_recipe_clear      Runs while the display shows something. When it ends, the display empties.
+#
+# The three buttons on the board do previous, next and clear.
+# Every step is a page, with the ingredients next to it. A very long step is split over several pages.
+# The display empties itself one hour after the last change. Change the duration of the timer below for another time.
+
+automation:
+  - id: epaper_recipe_from_mealie
+    alias: "Recipe display: recipe from Mealie"
+    description: Takes a recipe that Mealie sends and shows its first step on the e-paper display.
+    mode: queued
+    triggers:
+      - trigger: webhook
+        webhook_id: epaper_recipe
+        allowed_methods:
+          - POST
+        # Only requests from your home network get through. Home Assistant drops all others without telling the sender.
+        # If Mealie comes in from outside (Tailscale Funnel, Home Assistant Cloud, a reverse proxy), change the true
+        # in the line below to false and replace the webhook_id above with a long random one. It is then the only
+        # password. Do not add a second local_only line instead: Home Assistant only uses the last one.
+        local_only: true
+    conditions:
+      - condition: template
+        value_template: "{{ trigger.json is defined and trigger.json is mapping }}"
+    variables:
+      # Mealie sends the recipe inside "content". Older versions send the recipe itself, with names like recipeInstructions.
+      # The display wraps the text itself, so the lines stay whole here. Mealie writes fractions with small digits,
+      # like "¹/₂". They become ½, ¼ and ¾, or normal digits like 1/3 where the font has no fraction.
+      # The font of the display has the letters of the European languages that use the Latin alphabet. Emoji are
+      # dropped and other unknown characters become a question mark. The characters the font has are listed under
+      # "font" in esphome/mealie-epaper.yaml, so change both together.
+      # A step of more than 600 characters is split, so that every page fits on the display. It appears twice.
+      recipe: >-
+        {%- macro plain(text) -%}
+          {%- set ns = namespace(t = text | default('', true) | string) -%}
+          {%- for from, to in [
+            ('\r', ''), ('[\t\u00a0\u2009\u202f]', ' '), ('\\*\\*|__', ''),
+            ('[⁰₀]', '0'), ('[¹₁]', '1'), ('[²₂]', '2'), ('[³₃]', '3'), ('[⁴₄]', '4'), ('[⁵₅]', '5'),
+            ('[⁶₆]', '6'), ('[⁷₇]', '7'), ('[⁸₈]', '8'), ('[⁹₉]', '9'), ('⁄', '/'),
+            ('(?<![0-9/])1/2(?![0-9/])', '½'), ('(?<![0-9/])1/4(?![0-9/])', '¼'), ('(?<![0-9/])3/4(?![0-9/])', '¾'),
+            ('(?<=[0-9])(?=[⅓⅔⅛⅜⅝⅞])', ' '),
+            ('⅓', '1/3'), ('⅔', '2/3'), ('⅛', '1/8'), ('⅜', '3/8'), ('⅝', '5/8'), ('⅞', '7/8'),
+            ('Ĳ', 'IJ'), ('ĳ', 'ij'), ('ŉ', "'n"),
+            ('[\u00ad\u200b-\u200f\u2190-\u2bff\ufe00-\ufe0f\U0001f000-\U0001faff]', ''),
+            ('[^ -~\n\u00a1-\u017e–—‘’‚“”„•…‹›€™−]', '?'),
+            (' {2,}', ' '), ('\n{3,}', '\n\n')
+          ] -%}
+            {%- set ns.t = ns.t | regex_replace(from, to) -%}
+          {%- endfor -%}
+          {{- ns.t | trim -}}
+        {%- endmacro -%}
+        {%- set data = trigger.json | default({}, true) -%}
+        {%- set source = data.content if data.content is mapping else data -%}
+        {%- set steps = source.recipe_instructions | default(source.recipeInstructions | default([], true), true)
+          | selectattr('text') | list -%}
+        {%- set ns = namespace(ingredients = [], pages = []) -%}
+        {%- for item in source.recipe_ingredient | default(source.recipeIngredient | default([], true), true) -%}
+          {%- set title = plain(item.title) | replace('\n', ' ') -%}
+          {%- set text = plain(item.display | default('', true) or item.note) | replace('\n', ' ') | regex_replace('^#+ *', '') -%}
+          {#- The display draws a line that starts with "# " as the title of a section. -#}
+          {%- set ns.ingredients = ns.ingredients + (['# ' ~ title] if title else []) + ([text] if text else []) -%}
+        {%- endfor -%}
+        {%- for step in steps -%}
+          {%- set number = loop.index -%}
+          {%- set title = plain(step.title) | replace('\n', ' ') -%}
+          {%- set text = (title ~ ':\n' if title else '') ~ plain(step.text) -%}
+          {#- The parts of a split step get about the same length. -#}
+          {%- set limit = [600, (text | length / ((text | length / 600) | round(0, 'ceil') or 1)) | int + 40] | min -%}
+          {%- set parts = namespace(done = [], now = '') -%}
+          {%- for paragraph in text.split('\n') -%}
+            {%- for piece in (paragraph | wordwrap(limit)).split('\n') -%}
+              {%- if parts.now and (parts.now ~ piece) | length >= limit -%}
+                {%- set parts.done = parts.done + [parts.now | trim] -%}
+                {%- set parts.now = piece -%}
+              {%- else -%}
+                {%- set parts.now = (parts.now ~ '\n' if parts.now else '') ~ piece -%}
+              {%- endif -%}
+            {%- endfor -%}
+          {%- endfor -%}
+          {%- for text in parts.done + [parts.now | trim] -%}
+            {%- set page = '%d/%d' | format(number, steps | length) ~ (' (%d/%d)' | format(loop.index, loop.length) if loop.length > 1 else '') -%}
+            {%- set ns.pages = ns.pages + [{'page': page, 'text': text}] -%}
+          {%- endfor -%}
+        {%- endfor -%}
+        {%- set scale = data.recipe_scale | default(1, true) | float(1) -%}
+        {{ {
+          'name': plain(source.name) | replace('\n', ' ') or '-',
+          'ingredients': ns.ingredients | join('\n'),
+          'pages': ns.pages,
+          'scale': '' if scale == 1 else '%g' | format(scale)
+        } }}
+    actions:
+      - action: counter.set_value
+        target:
+          entity_id: counter.epaper_recipe_page
+        data:
+          value: 1
+      # The sensor below keeps the recipe for the screen sensor and the scripts.
+      - event: epaper_recipe
+        event_data:
+          name: "{{ recipe.name }}"
+          ingredients: "{{ recipe.ingredients }}"
+          pages: "{{ recipe.pages }}"
+          scale: "{{ recipe.scale }}"
+      - action: timer.start
+        target:
+          entity_id: timer.epaper_recipe_clear
+
+  - id: epaper_recipe_buttons
+    alias: "Recipe display: buttons"
+    description: Runs the next, previous and clear scripts when a button on the e-paper board is pressed.
+    mode: queued
+    triggers:
+      - trigger: event
+        event_type: esphome.epaper_recipe_button
+    conditions:
+      - condition: template
+        value_template: "{{ trigger.event.data.button | default('') in ['next', 'previous', 'clear'] }}"
+    actions:
+      - action: "script.epaper_recipe_{{ trigger.event.data.button }}"
+
+template:
+  - triggers:
+      - trigger: event
+        event_type: epaper_recipe
+    sensor:
+      - name: "Epaper recipe"
+        unique_id: epaper_recipe
+        icon: mdi:chef-hat
+        state: "{{ (trigger.event.data.name | string)[:255] }}"
+        attributes:
+          ingredients: "{{ trigger.event.data.ingredients }}"
+          pages: "{{ trigger.event.data.pages }}"
+          scale: "{{ trigger.event.data.scale }}"
+
+  # The board reads the five attributes of this sensor. They are all empty while the timer is not running, and the
+  # board then shows a white screen. The sensor sends only data: the words on the display come from the firmware.
+  - sensor:
+      - name: "Epaper recipe screen"
+        unique_id: epaper_recipe_screen
+        icon: mdi:tablet
+        # Not before the timer and the counter are loaded, or the display goes white for a moment when Home Assistant starts.
+        availability: >-
+          {{ states('timer.epaper_recipe_clear') in ['idle', 'active', 'paused']
+            and states('counter.epaper_recipe_page') | is_number }}
+        state: "{{ 'blank' if is_state('timer.epaper_recipe_clear', 'idle') or not has_value('sensor.epaper_recipe') else 'recipe' }}"
+        attributes:
+          title: >-
+            {{ '' if is_state('timer.epaper_recipe_clear', 'idle') or not has_value('sensor.epaper_recipe')
+              else states('sensor.epaper_recipe') }}
+          # The number of the step, like "3/8", or "3/8 (1/2)" for the first half of a long step.
+          page: >-
+            {%- set pages = state_attr('sensor.epaper_recipe', 'pages') or [] -%}
+            {%- set show = [[states('counter.epaper_recipe_page') | int(1), pages | length] | min, 1] | max -%}
+            {{ '' if is_state('timer.epaper_recipe_clear', 'idle') or not pages else pages[show - 1].page }}
+          step: >-
+            {%- set pages = state_attr('sensor.epaper_recipe', 'pages') or [] -%}
+            {%- set show = [[states('counter.epaper_recipe_page') | int(1), pages | length] | min, 1] | max -%}
+            {{ '' if is_state('timer.epaper_recipe_clear', 'idle') or not pages else pages[show - 1].text }}
+          # One ingredient per line. A line that starts with "# " is the title of a section.
+          ingredients: >-
+            {{ '' if is_state('timer.epaper_recipe_clear', 'idle')
+              else state_attr('sensor.epaper_recipe', 'ingredients') | default('', true) }}
+          # Empty, or the number the recipe was multiplied with in Mealie. The amounts in the ingredients are not multiplied.
+          scale: >-
+            {{ '' if is_state('timer.epaper_recipe_clear', 'idle')
+              else state_attr('sensor.epaper_recipe', 'scale') | default('', true) }}
+
+counter:
+  epaper_recipe_page:
+    name: "Epaper recipe page"
+    icon: mdi:book-open-page-variant
+    initial: 1
+    minimum: 1
+
+timer:
+  # The display shows the recipe while this timer runs. Every change on the display starts it again.
+  epaper_recipe_clear:
+    name: "Epaper recipe clear"
+    icon: mdi:timer-sand
+    duration: "01:00:00"
+    restore: true
+
+script:
+  epaper_recipe_show:
+    alias: "Recipe display: show step"
+    description: Shows a step of the recipe from Mealie on the e-paper display.
+    icon: mdi:chef-hat
+    mode: queued
+    fields:
+      page:
+        name: Page
+        description: The number of the page to show, starting at 1. Leave it out to show the current one again.
+        selector:
+          number:
+            min: 1
+            max: 999
+    sequence:
+      - action: counter.set_value
+        target:
+          entity_id: counter.epaper_recipe_page
+        data:
+          value: >-
+            {{ [[page | default(states('counter.epaper_recipe_page'), true) | int(1),
+              (state_attr('sensor.epaper_recipe', 'pages') or []) | length] | min, 1] | max }}
+      - action: timer.start
+        target:
+          entity_id: timer.epaper_recipe_clear
+
+  # If the display is empty, next and previous bring the current step back and do not move on.
+  epaper_recipe_next:
+    alias: "Recipe display: next step"
+    description: Shows the next step of the recipe on the e-paper display. It stays on the last one.
+    icon: mdi:page-next
+    mode: queued
+    sequence:
+      - action: script.epaper_recipe_show
+        data:
+          page: "{{ states('counter.epaper_recipe_page') | int(1) + (0 if is_state('timer.epaper_recipe_clear', 'idle') else 1) }}"
+
+  epaper_recipe_previous:
+    alias: "Recipe display: previous step"
+    description: Shows the previous step of the recipe on the e-paper display. It stays on the first one.
+    icon: mdi:page-previous
+    mode: queued
+    sequence:
+      - action: script.epaper_recipe_show
+        data:
+          page: "{{ states('counter.epaper_recipe_page') | int(1) - (0 if is_state('timer.epaper_recipe_clear', 'idle') else 1) }}"
+
+  epaper_recipe_clear:
+    alias: "Recipe display: clear"
+    description: Empties the e-paper display. The recipe stays in Home Assistant, so next or previous brings it back.
+    icon: mdi:tablet
+    mode: queued
+    sequence:
+      - action: timer.cancel
+        target:
+          entity_id: timer.epaper_recipe_clear

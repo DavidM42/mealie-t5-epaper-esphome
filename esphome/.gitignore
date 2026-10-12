@@ -1,0 +1,6 @@
+# Your own settings and passwords
+local.yaml
+secrets.yaml
+
+# ESPHome build files
+.esphome/

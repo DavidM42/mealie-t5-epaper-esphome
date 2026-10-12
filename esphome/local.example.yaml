@@ -1,0 +1,13 @@
+# Your own settings for the recipe display.
+#
+# Copy this file to local.yaml, set your values and flash local.yaml instead of mealie-epaper.yaml:
+#   esphome run local.yaml
+# Git ignores local.yaml, so what you set there stays out of the repository.
+# Everything under "substitutions" in mealie-epaper.yaml can be set here.
+
+substitutions:
+  # The language of the words on the display: en or de.
+  language: de
+
+packages:
+  recipe_display: !include mealie-epaper.yaml
