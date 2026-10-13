@@ -3,6 +3,7 @@
 # The board shows what the Home Assistant package homeassistant/mealie_epaper.yaml holds in
 # sensor.epaper_recipe_screen: the ingredients on the left, the current step on the right.
 # The three buttons on the board do previous, next and clear.
+# While there is no recipe, the board shows the song that plays, if you use homeassistant/music_epaper.yaml.
 #
 # Setup
 #   1. Put these three lines into secrets.yaml next to this file:
@@ -27,6 +28,11 @@ substitutions:
   language: en
   # The Home Assistant sensor with the screen. Only change it if you renamed the sensor in the package.
   screen_entity: sensor.epaper_recipe_screen
+  # The Home Assistant sensor with the song that plays, from the package homeassistant/music_epaper.yaml.
+  music_entity: sensor.epaper_music_screen
+  # Where the board loads the picture of the album cover from, like http://192.168.1.10:8123. If this is empty,
+  # the board uses the address that Home Assistant connects from, with port 8123.
+  home_assistant_url: ""
   # 0 or 180, depending on which way up the display stands.
   rotation: "0"
   # Page turns are quick partial refreshes that only move the pixels that change. Every so many refreshes all pixels
@@ -64,6 +70,11 @@ logger:
 api:
   encryption:
     key: !secret api_encryption_key
+  # The picture of the album cover comes from Home Assistant, so the board keeps the address of it.
+  on_client_connected:
+    - lambda: |-
+        if (client_info.rfind("Home Assistant", 0) == 0)
+          id(home_assistant_address) = client_address;
 
 ota:
   - platform: esphome
@@ -76,9 +87,26 @@ spi:
   clk_pin: ${pin_clk}
   mosi_pin: ${pin_mosi}
 
+# The picture of the album cover. Home Assistant makes it for this display: black and white, one bit per pixel.
+# The board has too little memory for the cover as the media player has it.
+http_request:
+
+image:
+  - platform: online_image
+    id: cover
+    # Only a start value. The script below sets the address of every picture.
+    url: http://homeassistant.local:8123/local/epaper_cover.bmp
+    format: BMP
+    type: BINARY
+    # The picture is decoded while it loads, so a small buffer is enough.
+    buffer_size: 1024
+    on_download_finished:
+      - lambda: id(cover_loaded) = id(cover_asked);
+      - script.execute: redraw
+
 # GF_Latin_Core has most letters of the European languages that use the Latin alphabet, among them the German
-# umlauts. The glyphs line adds the rest of them and the fractions. The Home Assistant package replaces every
-# character that is not in here, so change both together.
+# umlauts. The glyphs line adds the rest of them and the fractions. The Home Assistant packages replace every
+# character that is not in here, so change them together.
 font:
   - file: "gfonts://${font_title}@${font_title_weight}"
     id: font_header
@@ -128,12 +156,18 @@ font:
     ignore_missing_glyphs: true
 
 globals:
-  # What the display shows: title, page, step, ingredients and scale. The display draws from this copy and not from
-  # the sensors, so that it can draw the same picture a second time.
+  # What the display shows: title, page, step, ingredients and scale of the recipe, then title, artist, album and
+  # cover of the song. The display draws from this copy and not from the sensors, so that it can draw the same
+  # picture a second time.
   - id: shown
     type: std::vector<std::string>
     restore_value: false
-    initial_value: "std::vector<std::string>(5)"
+    initial_value: "std::vector<std::string>(9)"
+  # What the display should show, in the same order.
+  - id: wanted
+    type: std::vector<std::string>
+    restore_value: false
+    initial_value: "std::vector<std::string>(9)"
   - id: drawn_once
     type: bool
     restore_value: false
@@ -143,6 +177,20 @@ globals:
     type: bool
     restore_value: false
     initial_value: "false"
+  # The picture of the cover that the board asked Home Assistant for last, and the one it has loaded. Both are
+  # values of the attribute "cover" of the music sensor.
+  - id: cover_asked
+    type: std::string
+    restore_value: false
+    initial_value: '""'
+  - id: cover_loaded
+    type: std::string
+    restore_value: false
+    initial_value: '""'
+  - id: home_assistant_address
+    type: std::string
+    restore_value: false
+    initial_value: '""'
 
 # Home Assistant sends an attribute when it changes, and all of them again when the board connects.
 text_sensor:
@@ -166,47 +214,126 @@ text_sensor:
   - id: ha_scale
     attribute: scale
     <<: *screen_attribute
+  # The song that plays. Without the package for it, these stay empty.
+  - id: ha_music_title
+    attribute: title
+    <<: &music_attribute
+      platform: homeassistant
+      entity_id: ${music_entity}
+      internal: true
+      on_value:
+        - script.execute: redraw
+  - id: ha_music_artist
+    attribute: artist
+    <<: *music_attribute
+  - id: ha_music_album
+    attribute: album
+    <<: *music_attribute
+  - id: ha_music_cover
+    attribute: cover
+    <<: *music_attribute
 
 script:
   # One change in Home Assistant arrives as several attributes. The short wait makes one refresh out of them.
-  # A page turn is a fast refresh. A new recipe, an empty display and the first picture after a start are a slow
-  # refresh: it flashes and takes about four seconds, and it removes the shadows that fast refreshes leave behind.
+  # A page turn and the next song are a fast refresh. A new recipe, an empty display, the change between recipe and
+  # music and the first picture after a start are a slow refresh: it flashes and takes about four seconds, and it
+  # removes the shadows that fast refreshes leave behind.
   - id: redraw
     mode: restart
     then:
       - delay: 200ms
+      - lambda: |-
+          // The recipe comes first. The song shows while there is no recipe.
+          std::vector<std::string> next = {id(ha_title).state, id(ha_page).state, id(ha_step).state,
+                                           id(ha_ingredients).state, id(ha_scale).state, "", "", "", ""};
+          if (next[0].empty() && next[1].empty() && next[2].empty() && next[3].empty()) {
+            // Home Assistant ends these texts with a zero-width space, see the package. The fonts do not have it.
+            auto text = [](std::string value) -> std::string {
+              const std::string mark = "\u200b";
+              if (value.size() >= mark.size() && value.compare(value.size() - mark.size(), mark.size(), mark) == 0)
+                value.resize(value.size() - mark.size());
+              return value;
+            };
+            next[5] = text(id(ha_music_title).state);
+            next[6] = text(id(ha_music_artist).state);
+            next[7] = text(id(ha_music_album).state);
+            if (!next[5].empty() || !next[6].empty() || !next[7].empty())
+              next[8] = id(ha_music_cover).state;
+          }
+          id(wanted) = next;
       - while:
           condition:
-            lambda: |-
-              return id(need_sync) || !id(drawn_once) ||
-                     id(shown) != std::vector<std::string>{id(ha_title).state, id(ha_page).state, id(ha_step).state,
-                                                           id(ha_ingredients).state, id(ha_scale).state};
+            lambda: return id(need_sync) || !id(drawn_once) || id(shown) != id(wanted);
           then:
             # The panel does not take a new picture while it is still refreshing.
             - wait_until:
                 condition:
                   lambda: return !id(epaper).is_in_loop_state() && !id(epaper_clean).is_in_loop_state();
-            - lambda: |-
-                if (id(need_sync)) {
-                  // The fast refresh only moves the pixels that differ from the picture the panel remembers, and the
-                  // slow refresh does not write that memory. Drawing the same picture again with the fast one does.
-                  id(need_sync) = false;
-                  id(epaper).update();
-                  return;
-                }
-                const std::vector<std::string> wanted = {id(ha_title).state, id(ha_page).state, id(ha_step).state,
-                                                         id(ha_ingredients).state, id(ha_scale).state};
-                const bool blank = wanted[0].empty() && wanted[1].empty() && wanted[2].empty() && wanted[3].empty();
-                const bool new_recipe = !id(shown)[0].empty() && wanted[0] != id(shown)[0];
-                const bool clean = !id(drawn_once) || blank || new_recipe;
-                id(shown) = wanted;
-                id(drawn_once) = true;
-                if (clean) {
-                  id(need_sync) = true;
-                  id(epaper_clean).update();
-                } else {
-                  id(epaper).update();
-                }
+            - if:
+                condition:
+                  lambda: return id(need_sync);
+                then:
+                  - lambda: |-
+                      // The fast refresh only moves the pixels that differ from the picture the panel remembers, and the
+                      // slow refresh does not write that memory. Drawing the same picture again with the fast one does.
+                      id(need_sync) = false;
+                      id(epaper).update();
+                else:
+                  # The picture of a new cover is loaded before the song is drawn, so that both come with one
+                  # refresh. A picture that does not come within a few seconds is left out.
+                  - if:
+                      condition:
+                        lambda: return !id(wanted)[8].empty() && id(wanted)[8] != id(cover_loaded);
+                      then:
+                        - wait_until:
+                            condition:
+                              lambda: return !id(cover).is_decoding();
+                            timeout: 8s
+                        - lambda: |-
+                            const std::string &picture = id(wanted)[8];
+                            // Still loading the one before, loaded while waiting, or tried without success.
+                            if (id(cover).is_decoding() || picture == id(cover_loaded) || picture == id(cover_asked))
+                              return;
+                            std::string address = "${home_assistant_url}";
+                            if (address.empty() && !id(home_assistant_address).empty())
+                              address = "http://" + id(home_assistant_address) + ":8123";
+                            while (!address.empty() && address.back() == '/')
+                              address.pop_back();
+                            id(cover_asked) = picture;
+                            // The new picture overwrites the old one in memory while it loads.
+                            id(cover_loaded).clear();
+                            if (address.empty())
+                              return;
+                            id(cover).set_url(address + picture);
+                            id(cover).update();
+                        # When the picture is there, the image above starts this script again.
+                        - wait_until:
+                            condition:
+                              lambda: return !id(cover).is_decoding();
+                            timeout: 8s
+                        - lambda: |-
+                            if (id(wanted)[8] != id(cover_loaded))
+                              id(wanted)[8].clear();
+                  - lambda: |-
+                      const std::vector<std::string> &next = id(wanted);
+                      // What a screen is: 0 is empty, 1 is a recipe, 2 is a song.
+                      auto kind = [](const std::vector<std::string> &screen) -> int {
+                        if (!screen[0].empty() || !screen[1].empty() || !screen[2].empty() || !screen[3].empty())
+                          return 1;
+                        return screen[5].empty() && screen[6].empty() && screen[7].empty() ? 0 : 2;
+                      };
+                      const bool blank = kind(next) == 0;
+                      const bool new_recipe = !id(shown)[0].empty() && next[0] != id(shown)[0];
+                      const bool other_kind = kind(id(shown)) != 0 && kind(next) != kind(id(shown));
+                      const bool clean = !id(drawn_once) || blank || new_recipe || other_kind;
+                      id(shown) = next;
+                      id(drawn_once) = true;
+                      if (clean) {
+                        id(need_sync) = true;
+                        id(epaper_clean).update();
+                      } else {
+                        id(epaper).update();
+                      }
 
 # The buttons pull their pin to ground. The board has the pull-up resistors.
 binary_sensor:
@@ -304,11 +431,15 @@ display:
       std::string step = id(shown)[2];
       const std::string &ingredients = id(shown)[3];
       std::string scale = id(shown)[4];
+      const std::string &song = id(shown)[5];
+      const std::string &artist = id(shown)[6];
+      const std::string &album = id(shown)[7];
 
       // Nothing to show: the display stays white.
-      if (title.empty() && page.empty() && step.empty() && ingredients.empty())
+      const bool recipe = !title.empty() || !page.empty() || !step.empty() || !ingredients.empty();
+      if (!recipe && song.empty() && artist.empty() && album.empty())
         return;
-      if (step.empty() && page.empty())
+      if (recipe && step.empty() && page.empty())
         step = german ? "Dieses Rezept hat keine Schritte." : "This recipe has no steps.";
 
       const int width = it.get_width();
@@ -397,6 +528,62 @@ display:
         }
         return lines;
       };
+
+      // No recipe: the song that plays. Its cover is on the left, if Home Assistant has made a picture of it.
+      if (!recipe) {
+        const int gap = 32;
+        int text_x = 40;
+        if (!id(shown)[8].empty() && id(shown)[8] == id(cover_loaded) && id(cover).get_width() > 0) {
+          // The picture is as far from the left edge as from the top and the bottom. The thin frame is for covers
+          // that are white at their edge.
+          const int edge = std::max(0, (height - id(cover).get_height()) / 2);
+          it.image(edge, edge, id(cover), paper, ink);
+          it.rectangle(edge - 1, edge - 1, id(cover).get_width() + 2, id(cover).get_height() + 2, ink);
+          text_x = edge + id(cover).get_width() + gap;
+        }
+        const int song_width = width - gap - text_x;
+        // Title, artist and album, each in its own size and with a limit of lines. Together they sit in the middle
+        // of the height.
+        struct Part {
+          const std::string &text;
+          display::BaseFont *font;
+          size_t max_lines;
+          int gap;  // space above the part
+        };
+        const Part parts[] = {{song, id(font_step_large), 3, 0},
+                              {artist, id(font_step_medium), 2, 14},
+                              {album, id(font_step_small), 2, 10}};
+        struct Block {
+          display::BaseFont *font;
+          Metrics m;
+          std::vector<std::string> lines;
+          int gap;
+        };
+        std::vector<Block> blocks;
+        int needed = 0;
+        for (const Part &part : parts) {
+          if (part.text.empty())
+            continue;
+          std::vector<std::string> lines = wrap(part.font, part.text, song_width);
+          if (lines.size() > part.max_lines) {
+            lines.resize(part.max_lines);
+            lines.back() = shorten(part.font, lines.back(), song_width);
+          }
+          const Metrics m = metrics(part.font);
+          const int above = blocks.empty() ? 0 : part.gap;
+          needed += above + m.line * (int) lines.size();
+          blocks.push_back({part.font, m, lines, above});
+        }
+        int y = (height - needed) / 2;
+        for (const Block &block : blocks) {
+          y += block.gap;
+          for (const std::string &line : block.lines) {
+            it.print(text_x, y - block.m.shift, block.font, ink, TextAlign::TOP_LEFT, line.c_str());
+            y += block.m.line;
+          }
+        }
+        return;
+      }
 
       // Header: the name of the recipe on the left, the number of the step on the right.
       it.filled_rectangle(0, 0, width, header_height, ink);

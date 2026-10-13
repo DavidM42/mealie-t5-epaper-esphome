@@ -1,0 +1,129 @@
+# Home Assistant package: show the song that plays on the e-paper display.
+#
+# While the display shows no recipe, it shows the title, the artist and the album of the song that a media player
+# plays, with the album cover in black and white. A recipe always comes first.
+# This is an addition to mealie_epaper.yaml. It also works without it.
+#
+# Setup
+#   1. Copy this file and epaper_cover.py to <config>/packages/.
+#   2. In your copy, set your media player and where it has to play. Both are right below, under "variables".
+#   3. Make the folder <config>/www if you do not have it. The picture of the cover goes there.
+#   4. Restart Home Assistant.
+#
+# What you get
+#   sensor.epaper_music_screen   What the display shows while there is no recipe. The board reads this.
+#
+# The cover
+#   The display has only black and white, and the board has little memory. So epaper_cover.py makes a small
+#   picture of black and white dots out of the cover and saves it as <config>/www/epaper_cover.bmp. The board loads
+#   it from http://<home assistant>:8123/local/epaper_cover.bmp. Like everything in www, it can be loaded without
+#   a login.
+
+automation:
+  - id: epaper_music
+    alias: "Recipe display: music"
+    description: Keeps the song that plays for the e-paper display and makes the picture of its cover.
+    mode: queued
+    max_exceeded: silent
+    variables:
+      # Your media player. For Spotify it is media_player.spotify_ and then the name of your account.
+      player: &player media_player.spotify
+      # The display shows the song only while the player plays on one of these. They are the names that the
+      # attribute "source" of the player has. With "sources: []" it does not matter where it plays.
+      sources:
+        - Kitchen
+      # The address of this Home Assistant from the inside. The cover is loaded from there.
+      home_assistant: http://127.0.0.1:8123
+      plays: "{{ is_state(player, 'playing') and (not sources or state_attr(player, 'source') in sources) }}"
+      picture: "{{ state_attr(player, 'entity_picture') | default('', true) if plays else '' }}"
+      # The font of the display has the letters of the European languages that use the Latin alphabet. Emoji are
+      # dropped and other unknown characters become a question mark, as in mealie_epaper.yaml. The characters the
+      # font has are listed under "font" in esphome/mealie-epaper.yaml, so change them together.
+      # Home Assistant turns a text like "True", "1979" or "1, 2, 3, 4" into a value that is no text any more. A
+      # zero-width space at the end stops that. The display drops it.
+      # The picture is kept without its token, which is new after every start of Home Assistant.
+      song: >-
+        {%- macro text(value) -%}
+          {%- set ns = namespace(t = value | default('', true) | string) -%}
+          {%- for from, to in [
+            ('[\r\n\t\u00a0\u2009\u202f]', ' '),
+            ('Ĳ', 'IJ'), ('ĳ', 'ij'), ('ŉ', "'n"),
+            ('[\u00ad\u200b-\u200f\u2190-\u2bff\ufe00-\ufe0f\U0001f000-\U0001faff]', ''),
+            ('[^ -~\u00a1-\u017e–—‘’‚“”„•…‹›€™−]', '?'),
+            (' {2,}', ' ')
+          ] -%}
+            {%- set ns.t = ns.t | regex_replace(from, to) -%}
+          {%- endfor -%}
+          {{- (ns.t | trim) ~ '\u200b' if ns.t | trim else '' -}}
+        {%- endmacro -%}
+        {{ {
+          'title': text(state_attr(player, 'media_title')) if plays else '',
+          'artist': text(state_attr(player, 'media_artist')) if plays else '',
+          'album': text(state_attr(player, 'media_album_name')) if plays else '',
+          'picture': picture | regex_replace('token=[^&]*&?', '')
+        } }}
+    triggers:
+      - trigger: state
+        entity_id: *player
+      - trigger: homeassistant
+        event: start
+    conditions:
+      # The player reports again and again while it plays. There is nothing to do until the song changes.
+      - condition: template
+        value_template: >-
+          {%- set screen = 'sensor.epaper_music_screen' -%}
+          {{ song.title != state_attr(screen, 'title') or song.artist != state_attr(screen, 'artist')
+            or song.album != state_attr(screen, 'album') or song.picture != state_attr(screen, 'picture') }}
+    actions:
+      - variables:
+          new_cover: "{{ song.picture != '' and song.picture != state_attr('sensor.epaper_music_screen', 'picture') }}"
+          made:
+            returncode: -1
+      - if:
+          - condition: template
+            value_template: "{{ new_cover }}"
+        then:
+          - action: shell_command.epaper_music_cover
+            data:
+              address: "{{ picture if picture.startswith('http') else home_assistant ~ picture }}"
+            response_variable: made
+            continue_on_error: true
+      # The sensor below keeps the song for the display. If the picture could not be made, the song shows without
+      # it, and the next report of the player tries again.
+      - event: epaper_music
+        event_data:
+          title: "{{ song.title }}"
+          artist: "{{ song.artist }}"
+          album: "{{ song.album }}"
+          picture: "{{ '' if new_cover and made.returncode != 0 else song.picture }}"
+          # The number at the end is new for every picture. It tells the board to load the file again.
+          cover: >-
+            {%- if new_cover -%}
+              {{ '/local/epaper_cover.bmp?v=%d' | format(now().timestamp() * 1000) if made.returncode == 0 else '' }}
+            {%- elif song.picture -%}
+              {{ state_attr('sensor.epaper_music_screen', 'cover') | default('', true) }}
+            {%- endif -%}
+
+template:
+  # The board reads the attributes of this sensor. They are all empty while nothing plays. The sensor sends only
+  # data: where it goes on the display is up to the firmware.
+  - triggers:
+      - trigger: event
+        event_type: epaper_music
+    sensor:
+      - name: "Epaper music screen"
+        unique_id: epaper_music_screen
+        icon: mdi:music
+        state: "{{ 'music' if trigger.event.data.title or trigger.event.data.artist or trigger.event.data.album else 'blank' }}"
+        attributes:
+          title: "{{ trigger.event.data.title }}"
+          artist: "{{ trigger.event.data.artist }}"
+          album: "{{ trigger.event.data.album }}"
+          # Where the board finds the picture for the display, or empty if there is none.
+          cover: "{{ trigger.event.data.cover }}"
+          # The cover of the player that the picture was made of.
+          picture: "{{ trigger.event.data.picture }}"
+
+shell_command:
+  # Home Assistant runs this in its configuration folder. The number is the size of the picture in pixels.
+  epaper_music_cover: python3 packages/epaper_cover.py "{{ address }}" www/epaper_cover.bmp 400

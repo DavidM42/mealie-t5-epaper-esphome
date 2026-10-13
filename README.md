@@ -12,6 +12,7 @@ middle, and the display runs [ESPHome](https://esphome.io).
 - Turn the pages with the three buttons on the board, or from Home Assistant.
 - A page turn takes about 1.4 seconds and does not flash.
 - The display empties itself one hour after the last change.
+- While there is no recipe, it can show the song that plays, with the album cover in black and white.
 - Labels in English or German.
 
 ## How it works
@@ -117,10 +118,50 @@ There are two kinds of refresh:
 
 | Refresh | When | Time |
 |---|---|---|
-| Fast | Page turns | About 1.4 seconds, no flashing |
-| Clean | A new recipe, emptying the display, the first picture after a start | 5 to 7 seconds, flashes |
+| Fast | Page turns, the next song | About 1.4 seconds, no flashing |
+| Clean | A new recipe, emptying the display, the change between recipe and music, the first picture after a start | 5 to 7 seconds, flashes |
 
 The fast refresh leaves faint shadows of older pages. The clean one removes them.
+
+## Music
+
+While the display shows no recipe, it can show the song that a media player plays: the title, the artist, the
+album and the album cover in black and white. A recipe always comes first. When the recipe is gone, the song is
+back.
+
+![The display with an album cover on the left and the title, artist and album of a song on the right](docs/music.png)
+
+*This picture comes from the drawing code of the firmware too. The song and the cover are made up.*
+
+1. Copy [homeassistant/music_epaper.yaml](homeassistant/music_epaper.yaml) and
+   [homeassistant/epaper_cover.py](homeassistant/epaper_cover.py) to `<config>/packages/`.
+2. In your copy of `music_epaper.yaml`, set your media player and its sources. Both are under `variables`:
+
+   ```yaml
+   player: &player media_player.spotify_yourname
+   sources:
+     - Kitchen
+   ```
+
+   The display shows the song only while the player plays on one of the sources. They are the names that the
+   attribute `source` of the player has. With `sources: []` it does not matter where the player plays.
+3. Make the folder `<config>/www` if you do not have it.
+4. Restart Home Assistant.
+5. Flash the display again if its firmware is from before this was added.
+
+The song shows as long as the player plays. A pause empties the display.
+
+The display has only black and white, and the board has too little memory for the cover as the player has it. So
+`epaper_cover.py` makes a picture of 400 x 400 black and white dots inside Home Assistant, and the board loads it
+from `http://<home assistant>:8123/local/epaper_cover.bmp`. Like everything in `www`, this picture can be loaded
+without a login.
+
+The board takes the address that Home Assistant connects from, and port 8123. If your Home Assistant has another
+port or uses HTTPS, set `home_assistant_url` for the board and `home_assistant` in the package. Without the
+picture, the display shows the song alone.
+
+This was written for the Spotify integration. Other players work if they have the attributes `media_title`,
+`media_artist`, `media_album_name` and `entity_picture`.
 
 ## Your own settings
 
@@ -143,6 +184,7 @@ packages:
 | `line_spacing` | `86` | Distance between lines, in percent of what the text font asks for |
 | `rotation` | `0` | `0` or `180`, depending on which way up the display stands |
 | `full_update_every` | `8` | After this many fast refreshes, one refresh moves every pixel |
+| `home_assistant_url` | empty | Where the board loads the album cover from, like `http://192.168.1.10:8123`. Empty means the address that Home Assistant connects from, with port 8123 |
 | `name`, `friendly_name` | `mealie-epaper`, `Recipe display` | Name of the board in your network and in Home Assistant |
 | `pin_...` | T5 V2.4.1 | The pins of the display and the buttons |
 
