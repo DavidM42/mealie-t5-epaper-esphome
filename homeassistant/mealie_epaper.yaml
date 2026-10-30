@@ -76,14 +76,60 @@ automation:
           {%- endfor -%}
           {{- ns.t | trim -}}
         {%- endmacro -%}
+        {#- An amount the way Mealie writes it: a fraction with a denominator up to 32, like "2 3/4", or a decimal
+            number for units that have fractions turned off. -#}
+        {%- macro amount(value, fraction) -%}
+          {%- if not fraction -%}
+            {%- set value = value | round(3) -%}
+            {{- value | int if value == value | int else value -}}
+          {%- else -%}
+            {%- set best = namespace(n = 0, d = 1, error = 1) -%}
+            {%- for d in range(1, 33) -%}
+              {%- set n = (value * d) | round | int -%}
+              {%- if (value - n / d) | abs < best.error - 0.000001 -%}
+                {%- set best.n = n -%}
+                {%- set best.d = d -%}
+                {%- set best.error = (value - n / d) | abs -%}
+              {%- endif -%}
+            {%- endfor -%}
+            {%- set whole = best.n // best.d -%}
+            {%- set rest = best.n % best.d -%}
+            {%- if not rest -%}{{ whole }}{%- elif whole -%}{{ whole }} {{ rest }}/{{ best.d }}{%- else -%}{{ rest }}/{{ best.d }}{%- endif -%}
+          {%- endif -%}
+        {%- endmacro -%}
         {%- set data = trigger.json | default({}, true) -%}
         {%- set source = data.content if data.content is mapping else data -%}
         {%- set steps = source.recipe_instructions | default(source.recipeInstructions | default([], true), true)
           | selectattr('text') | list -%}
-        {%- set ns = namespace(ingredients = [], pages = []) -%}
+        {%- set scale = data.recipe_scale | default(1, true) | float(1) -%}
+        {#- Older versions of Mealie can show the ingredients as plain text without amounts. -#}
+        {%- set amounts = not (source.settings if source.settings is mapping else {}).disable_amount | default(false, true) -%}
+        {%- set ns = namespace(ingredients = [], pages = [], scaled = false) -%}
         {%- for item in source.recipe_ingredient | default(source.recipeIngredient | default([], true), true) -%}
           {%- set title = plain(item.title) | replace('\n', ' ') -%}
-          {%- set text = plain(item.display | default('', true) or item.note) | replace('\n', ' ') | regex_replace('^#+ *', '') -%}
+          {%- set quantity = item.quantity | float(0) * scale -%}
+          {%- if scale != 1 and quantity > 0 and amounts -%}
+            {#- A scaled recipe: the text is built again from amount, unit, food and note, like Mealie does. An
+                ingredient without an amount stays as it is, in Mealie too. -#}
+            {%- set unit = item.unit if item.unit is mapping else {} -%}
+            {%- set food = item.food if item.food is mapping else {} -%}
+            {%- set unit_name = ((unit.plural_abbreviation | default('', true) if quantity > 1 else '')
+              or unit.abbreviation | default('', true)) if unit.use_abbreviation | default(false, true) else '' -%}
+            {%- set unit_name = unit_name or (unit.plural_name | default('', true) if quantity > 1 else '')
+              or unit.name | default('', true) -%}
+            {#- With a unit, Mealie uses the plural of the food only in some languages. It is used here when the
+                unscaled text has it too. -#}
+            {%- set food_plural = food.plural_name | default('', true) -%}
+            {%- set food_name = food_plural if quantity > 1 and food_plural and (not unit or
+              (item.quantity | float(0) > 1 and food_plural in item.display | default('', true)))
+              else food.name | default('', true) -%}
+            {%- set display = [amount(quantity, unit.fraction | default(true)), unit_name, food_name,
+              item.note | default('', true)] | select | join(' ') -%}
+            {%- set ns.scaled = true -%}
+          {%- else -%}
+            {%- set display = item.display | default('', true) or item.note -%}
+          {%- endif -%}
+          {%- set text = plain(display) | replace('\n', ' ') | regex_replace('^#+ *', '') -%}
           {#- The display draws a line that starts with "# " as the title of a section. -#}
           {%- set ns.ingredients = ns.ingredients + (['# ' ~ title] if title else []) + ([text] if text else []) -%}
         {%- endfor -%}
@@ -109,12 +155,11 @@ automation:
             {%- set ns.pages = ns.pages + [{'page': page, 'text': text}] -%}
           {%- endfor -%}
         {%- endfor -%}
-        {%- set scale = data.recipe_scale | default(1, true) | float(1) -%}
         {{ {
           'name': plain(source.name) | replace('\n', ' ') or '-',
           'ingredients': ns.ingredients | join('\n'),
           'pages': ns.pages,
-          'scale': '' if scale == 1 else '%g' | format(scale)
+          'scale': '%g' | format(scale) if ns.scaled else ''
         } }}
     actions:
       - action: counter.set_value
@@ -188,7 +233,7 @@ template:
           ingredients: >-
             {{ '' if is_state('timer.epaper_recipe_clear', 'idle')
               else state_attr('sensor.epaper_recipe', 'ingredients') | default('', true) }}
-          # Empty, or the number the recipe was multiplied with in Mealie. The amounts in the ingredients are not multiplied.
+          # Empty, or the number the recipe was multiplied with in Mealie. The amounts in the ingredients are multiplied already.
           scale: >-
             {{ '' if is_state('timer.epaper_recipe_clear', 'idle')
               else state_attr('sensor.epaper_recipe', 'scale') | default('', true) }}

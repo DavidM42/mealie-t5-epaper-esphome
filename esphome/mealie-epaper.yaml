@@ -611,7 +611,7 @@ display:
       if (!scale.empty()) {
         if (german)
           std::replace(scale.begin(), scale.end(), '.', ',');
-        scale = (german ? "Mengen wie im Rezept, nicht ×" : "Amounts as written, not ×") + scale;
+        scale = (german ? "Mengen ×" : "Amounts ×") + scale;
       }
       display::BaseFont *ingredient_fonts[] = {id(font_ingredients_large), id(font_ingredients_medium),
                                                id(font_ingredients_small)};

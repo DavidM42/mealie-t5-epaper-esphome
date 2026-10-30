@@ -193,7 +193,8 @@ packages:
 - Each step is one page. A step of more than 600 characters is split over several pages, like "3/8 (1/2)".
 - The ingredients take the largest of three font sizes that fits. If even the smallest does not fit, the list ends
   with "+4 more".
-- If you scaled the recipe in Mealie, the display says so. The amounts on the display are not scaled.
+- If you scaled the recipe in Mealie, the amounts on the display are scaled too, and the list starts with
+  "Amounts ×2". Ingredients that Mealie has not parsed into amount, unit and food stay as written, like in Mealie.
 - The fonts have the letters of the European languages that use the Latin alphabet. Emoji are dropped, other
   unknown characters show as a question mark.
 - Fractions from Mealie show as ½, ¼ and ¾, others as 1/3 or 5/16.
